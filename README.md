@@ -30,6 +30,7 @@ The work was tested with an Oculus/Meta headset through SteamVR OpenXR.
 
 - `xinput1_3.cpp` - the x64 proxy DLL source.
 - `vtable_patch.cpp` - compatibility/vtable patching source used while adapting the core.
+- `Makefile` - MSVC/NMake build file for the proxy.
 - `README_FIX_ES.md` - the original investigation report and offset notes.
 - `TECHNICAL.md`, `SETTINGS.md`, and `THIRD_PARTY_NOTICES.md` - GrayHorizon documentation.
 
@@ -40,12 +41,36 @@ The work was tested with an Oculus/Meta headset through SteamVR OpenXR.
 - The original GrayHorizon/OpenXR development files.
 - A compatible `gh5vr_core.dll` base for patching.
 
-Build the proxy from a Developer Command Prompt or after loading `vcvars64.bat`:
+Build the proxy from an **x64 Native Tools Command Prompt for Visual Studio**:
 
 ```bat
-cd newmod
-cl /nologo /LD /O2 /EHsc xinput1_3.cpp /link /OUT:xinput1_3.dll
+cd source
+nmake /f Makefile
 ```
+
+The rebuilt DLL is written to `source\dist\xinput1_3.dll`. Copy that file to
+the game's release/mod folder when installing the updated proxy. To remove the
+generated DLL and intermediate files, run:
+
+```bat
+nmake /f Makefile clean
+```
+
+### Composed image scale (distance)
+
+`VIEW_FOV_SCALE` is `0.67`. In this core the FOV returned by `xrLocateViews`
+feeds the OpenXR composition layer (verified empirically: `1.30` made the
+image bigger), so `0.67` shrinks the composed image to about two thirds of its
+angular size - the world looks roughly one third farther away, with black
+around it. The game render, pose, stereo separation and synthetic mouse-look
+are untouched. Tune the constant in `xinput1_3.cpp` and rebuild to change the
+amount (`1.0` = original size).
+Changing the compositor image size (with black borders) would require changing
+the core's OpenXR composition layer, not the camera pose hook in this proxy.
+
+If invalid camera data is encountered, the proxy rejects it and records a
+`rejected invalid ... camera matrix` line in `gh5vr_new.log`; this is useful for
+diagnosing any remaining black-frame flicker.
 
 The source is intentionally Windows/MSVC-specific because it uses Win32 DLL proxying,
 `user32.dll` mouse input, process memory protection, and x64 function hooks.

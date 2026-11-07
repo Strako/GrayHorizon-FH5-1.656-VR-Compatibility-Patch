@@ -16,6 +16,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
+#include <intrin.h>
 
 #pragma comment(lib, "user32.lib")
 
@@ -92,10 +94,48 @@ static int g_exc_logged = 0;
 static int g_set1_logged = 0;
 static int g_set2_logged = 0;
 static int g_fov_logged = 0;
+static volatile LONG g_bad_matrix_count = 0;
+
+static int ValidMatrix(const float* m) {
+    int nonZero = 0;
+    for (int i = 0; i < 16; i++) {
+        if (!_finite(m[i]) || fabsf(m[i]) > 1000000.0f) return 0;
+        if (fabsf(m[i]) > 0.000001f) nonZero++;
+    }
+    return nonZero >= 4;
+}
+
+static void StoreMatrix(void* dst, const float* matrix) {
+    // FH5 may read this object concurrently from its render thread.  Commit
+    // each SIMD-sized row atomically instead of exposing a torn memcpy.
+    if (((uintptr_t)dst & 15) != 0) {
+        memcpy(dst, matrix, 64);
+        return;
+    }
+    for (int row = 0; row < 4; row++) {
+        volatile LONG64* d = (volatile LONG64*)((char*)dst + row * 16);
+        LONG64 v[2];
+        memcpy(v, matrix + row * 4, 16);
+        LONG64 compare[2] = { d[0], d[1] };
+        while (!_InterlockedCompareExchange128(d, v[1], v[0], compare)) {
+            // compare is refreshed by the intrinsic when another writer wins.
+        }
+    }
+}
+
+static void LogBadMatrix(const char* which) {
+    LONG n = InterlockedIncrement(&g_bad_matrix_count);
+    if (n <= 3 || (n % 300) == 0)
+        Log("rejected invalid %s camera matrix (#%ld)\n", which, n);
+}
 
 static void SetMatrix1(void* cam, void* m) {
     if (!cam || !m) return;
-    memcpy((char*)cam + 0x10, m, 64);   // getter returns [cam+0x10]
+    float matrix[16];
+    __try { memcpy(matrix, m, sizeof(matrix)); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!ValidMatrix(matrix)) { LogBadMatrix("primary"); return; }
+    StoreMatrix((char*)cam + 0x10, matrix);   // getter returns [cam+0x10]
     if (!g_set1_logged) {
         g_set1_logged = 1;
         float* f = (float*)m;
@@ -104,7 +144,11 @@ static void SetMatrix1(void* cam, void* m) {
 }
 static void SetMatrix2(void* cam, void* m) {
     if (!cam || !m) return;
-    memcpy((char*)cam + 0x50, m, 64);   // second matrix (calibrate)
+    float matrix[16];
+    __try { memcpy(matrix, m, sizeof(matrix)); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!ValidMatrix(matrix)) { LogBadMatrix("secondary"); return; }
+    StoreMatrix((char*)cam + 0x50, matrix);   // second matrix (calibrate)
     if (!g_set2_logged) {
         g_set2_logged = 1;
         float* f = (float*)m;
@@ -167,6 +211,12 @@ static int InOurModule(void* p) {
 // Negative signs: head left/up must turn the game camera left/up.
 static const float SENS_X = -45.0f;
 static const float SENS_Y = -45.0f;
+// In this core the FOV returned by xrLocateViews feeds the OpenXR
+// composition layer, not the game render (proven empirically: 1.30 made the
+// image BIGGER).  0.67 therefore shrinks the composed image to about 2/3 of
+// its angular size - the world looks roughly one third farther away, with
+// black around it.  Pose, stereo separation and mouse-look are untouched.
+static const float VIEW_FOV_SCALE = 0.67f;
 
 static int32_t OurXrLocateViews(uint64_t session, const void* info, void* state,
                                 uint32_t cap, uint32_t* count, XrView* views) {
@@ -175,6 +225,7 @@ static int32_t OurXrLocateViews(uint64_t session, const void* info, void* state,
     if (r >= 0 && views && count) {
         uint32_t n = *count;
         if (n > cap) n = cap;
+        if (n > 2) n = 2; // stereo has at most two views
         if (n > 0) {
             // GrayHorizon normally passes its compact 44-byte view layout,
             // but SteamVR can return the standard OpenXR layout (pose starts
@@ -217,10 +268,18 @@ static int32_t OurXrLocateViews(uint64_t session, const void* info, void* state,
                 }
                 // Freeze the view orientation: the picture stays square to the
                 // eye, and the head movement is applied to the game camera.
+                // Widen only the projection supplied to FH5.  Do not alter the
+                // runtime layer pose; that is what keeps the image attached to
+                // the glasses instead of making SteamVR world-lock it.
                 for (uint32_t i = 0; i < n; i++) {
                     unsigned char* v = raw + i * stride + qoff;
                     float identity[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                     memcpy(v, identity, sizeof(identity));
+                    float* fov = (float*)(raw + i * stride + qoff + 28);
+                    for (int j = 0; j < 4; j++) {
+                        if (_finite(fov[j]) && fabsf(fov[j]) < 3.2f)
+                            fov[j] *= VIEW_FOV_SCALE;
+                    }
                 }
             }
         }
@@ -232,55 +291,6 @@ static int32_t OurXrLocateViews(uint64_t session, const void* info, void* state,
 // at core+0x25A0A0.  Its per-frame locate call reads that slot, so replacing
 // the slot is enough - the OpenXR loader itself is left untouched.
 static void* g_poseSlot = NULL;
-
-// Replace every writable copy of the real xrLocateViews pointer (the core's
-// slot, the OpenXR dispatch tables and any cached copies) with our function.
-static int PatchAllCopies(void* real) {
-    int hits = 0;
-    uintptr_t a = 0;
-    const size_t CHUNK = 1u << 20;
-    while (a < 0x7fffffffffffULL) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi))) break;
-        int usable = (mbi.State == MEM_COMMIT) &&
-                     (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE |
-                                     PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) &&
-                     !(mbi.Protect & PAGE_GUARD);
-        if (usable) {
-            uintptr_t s = (uintptr_t)mbi.BaseAddress;
-            size_t total = mbi.RegionSize;
-            size_t done = 0;
-            unsigned char needle = (unsigned char)((uintptr_t)real & 0xff);
-            while (done + 8 <= total) {
-                size_t len = total - done;
-                if (len > CHUNK) len = CHUNK;
-                unsigned char* buf = (unsigned char*)(s + done);
-                __try {
-                    unsigned char* q = buf;
-                    unsigned char* end = buf + len;
-                    while ((q = (unsigned char*)memchr(q, needle, end - q)) != NULL) {
-                        uintptr_t at = (uintptr_t)q;
-                        if ((at & 7) == 0 && *(uintptr_t*)q == (uintptr_t)real &&
-                            !InOurModule(q)) {
-                            DWORD old = 0;
-                            if (VirtualProtect((LPVOID)at, 8, PAGE_READWRITE, &old)) {
-                                *(uintptr_t*)at = (uintptr_t)&OurXrLocateViews;
-                                VirtualProtect((LPVOID)at, 8, old, &old);
-                                hits++;
-                            }
-                        }
-                        q++;
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {}
-                if (done + len >= total) break;
-                done += len - 8;    // overlap: never split a pointer
-            }
-        }
-        if (mbi.RegionSize == 0) break;
-        a = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    }
-    return hits;
-}
 
 static void* g_locateEntry = NULL;
 static void* g_locateTramp = NULL;
@@ -363,6 +373,7 @@ static void DiagResolve(HMODULE core, void* cur) {
         *(void**)((uintptr_t)core+0x25a0b0), *(void**)((uintptr_t)core+0x25a0b8));
 }
 
+
 static void InstallPoseHook(void) {
     HMODULE core = GetModuleHandleA("gh5vr_core.dll");
     if (!core) return;
@@ -390,9 +401,8 @@ static void InstallPoseHook(void) {
     VirtualProtect(slot, sizeof(void*), old, &old);
 
     g_poseSlot = slot;
-    int copies = PatchAllCopies(cur);
     InterlockedExchange(&g_hookReady, 1);
-    Log("pose hook installed (inline=%d, extra copies=%d)\n", inlineHooked, copies);
+    Log("pose hook installed (inline=%d)\n", inlineHooked);
 }
 
 static DWORD WINAPI XrThread(LPVOID) {
@@ -411,8 +421,7 @@ static DWORD WINAPI XrThread(LPVOID) {
                     *(void**)g_poseSlot = (void*)&OurXrLocateViews;
                     VirtualProtect(g_poseSlot, sizeof(void*), old, &old);
                 }
-                int copies = PatchAllCopies(cur);
-                Log("pose hook: re-patched %d extra copies\n", copies);
+                Log("pose hook: core slot re-patched\n");
             }
         }
         Sleep(1000);
